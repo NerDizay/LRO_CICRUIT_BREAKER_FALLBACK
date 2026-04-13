@@ -1,127 +1,93 @@
 import asyncio
 import signal
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from django.core.management.base import BaseCommand
-from django.db import transaction
 
-from app.models import Task, TaskLog
-from app.services import LROClient
+from app.models import Task
+from app.repository import claim_pending_tasks, save_task_error, save_task_result
+from app.services import CircuitBreaker, CircuitBreakerOpen, LROClient
 
+
+TASK_TTL_SECONDS = 30
+EXPECTED_PEAK_RPS = 2
+PROCESSING_TIME = 10
+CONCURRENCY = EXPECTED_PEAK_RPS * PROCESSING_TIME * 2
 
 class LROWorker:
-    def __init__(self, concurrency: int, executor_workers: int = 4):
-        self.client = LROClient()
+    def __init__(
+        self,
+        concurrency: int,
+        executor_workers: int = 4,
+        cb_failure_threshold: int = 5,
+        cb_open_timeout: int = 30,
+    ) -> None:
+        cb = CircuitBreaker(failure_threshold=cb_failure_threshold, open_timeout=cb_open_timeout)
+        self.client = LROClient(circuit_breaker=cb)
         self.executor = ThreadPoolExecutor(max_workers=executor_workers)
-        self.queue = asyncio.Queue()
+        self.queue: asyncio.Queue[Task] = asyncio.Queue()
         self.concurrency = concurrency
         self._shutdown = False
+        self._stdout_log = False
 
-    def _log(self, msg: str):
-        import sys
-        sys.stdout.write(msg + '\n')
-        sys.stdout.flush()
+    def _log(self, msg: str) -> None:
+        if self._stdout_log:
+            sys.stdout.write(msg + '\n')
+            sys.stdout.flush()
 
-    def _claim_pending_tasks(self, limit=50):
-        """Атомарно забираем PENDING задачи и переводим в IN_PROGRESS."""
-        with transaction.atomic():
-            task_ids = list(
-                Task.objects.select_for_update(skip_locked=True)
-                .filter(status=Task.Status.PENDING)
-                .order_by('-created_at')
-                .values_list('task_id', flat=True)[:limit]
-            )
-            if not task_ids:
-                return []
-            Task.objects.filter(task_id__in=task_ids).update(
-                status=Task.Status.IN_PROGRESS
-            )
-            tasks = list(Task.objects.filter(task_id__in=task_ids))
+    def _claim_pending_tasks(self, limit: int) -> list[Task]:
+        return claim_pending_tasks(limit, TASK_TTL_SECONDS)
 
-        return tasks
+    async def _process_task(self, task: Task) -> None:
+        self._log(f'Processing task {task.task_id}, queue: {self.queue.qsize()}')
+        payload: dict = {'text': task.text}
 
-    def _update_task_error(self, task_id, error):
-        Task.objects.filter(task_id=task_id).update(
-            status=Task.Status.ERROR,
-            result={'error': str(error)},
-        )
-
-    async def _process_task(self, task):
-        payload = {'text': task.text}
-
-        resp1 = None
-        resp2 = None
-        err_method = None
-        err_msg = None
-
-        # 1-й асинхронный запрос
         try:
             resp1 = await self.client.method_one_async(payload)
+        except CircuitBreakerOpen:
+            resp2 = await self.client.method_fallback_async(payload)
+            await self._save_result(task, None, resp2, Task.Status.DONE_FALLBACK)
+            return
         except Exception as e:
-            err_method, err_msg = 'method_one_async', type(e).__name__
+            await self._save_error(task, payload, 'method_one_async', type(e).__name__)
+            resp2 = await self.client.method_fallback_async(payload)
+            await self._save_result(task, None, resp2, Task.Status.DONE_FALLBACK)
+            return
 
-        # 2-ой асинхронный запрос (только если первый успешен)
-        if resp1 is not None:
-            try:
-                payload2 = {'previous': resp1}
-                resp2 = await self.client.method_two_async(payload2)
-            except Exception as e:
-                err_method, err_msg = 'method_two_async', type(e).__name__
+        try:
+            payload2 = {'previous': resp1}
+            resp2 = await self.client.method_two_async(payload2)
+        except CircuitBreakerOpen:
+            resp2 = await self.client.method_fallback_async(payload)
+            await self._save_result(task, resp1, resp2, Task.Status.DONE_FALLBACK)
+            return
+        except Exception as e:
+            await self._save_error(task, {'previous': resp1}, 'method_two_async', type(e).__name__)
+            resp2 = await self.client.method_fallback_async(payload)
+            await self._save_result(task, resp1, resp2, Task.Status.DONE_FALLBACK)
+            return
 
-        # Один раз сохраняем всё
+        await self._save_result(task, resp1, resp2)
+
+    async def _save_result(self, task: Task, resp1: dict | None, resp2: dict, status: Task.Status = Task.Status.DONE_USUAL) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             self.executor,
-            lambda: self._save(task, payload, resp1, resp2, err_method, err_msg),
+            lambda: save_task_result(task, resp1, resp2, status),
         )
+        self._log(f'Saved result for task {task.task_id} (status={status.name})')
 
-        if err_method:
-            self._log(f'Task {task.task_id} failed on {err_method}: {err_msg}')
-        else:
-            self._log(f'Task {task.task_id} processed successfully')
-
-    def _save(self, task, payload, resp1, resp2, err_method, err_msg):
-        """Сохраняет логи и результат одним батчем."""
-        logs = []
-        if resp1 is not None:
-            logs.append(TaskLog(
-                task=task, method_name='method_one_async',
-                payload={'text': task.text}, response=resp1,
-            ))
-        if err_method == 'method_one_async':
-            logs.append(TaskLog(
-                task=task, method_name='method_one_async',
-                payload={'text': task.text}, response={'error': err_msg},
-            ))
-
-        if resp2 is not None:
-            logs.append(TaskLog(
-                task=task, method_name='method_two_async',
-                payload={'previous': resp1}, response=resp2,
-            ))
-        if err_method == 'method_two_async':
-            logs.append(TaskLog(
-                task=task, method_name='method_two_async',
-                payload={'previous': resp1}, response={'error': err_msg},
-            ))
-
-        with transaction.atomic():
-            if logs:
-                TaskLog.objects.bulk_create(logs)
-
-            if resp2 is not None:
-                Task.objects.filter(task_id=task.task_id).update(
-                    result=resp2, status=Task.Status.DONE_USUAL
-                )
-            else:
-                Task.objects.filter(task_id=task.task_id).update(
-                    status=Task.Status.ERROR,
-                    result={'error': err_msg} if err_msg else {},
-                )
-
-    async def worker(self, worker_id: int):
-        self._log(f'Worker {worker_id} started')
+    async def _save_error(self, task: Task, payload: dict, err_method: str, err_msg: str) -> None:
         loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self.executor,
+            lambda: save_task_error(task, payload, err_method, err_msg),
+        )
+        self._log(f'Saved error for task {task.task_id} ({err_method}: {err_msg})')
+
+    async def worker(self, worker_id: int) -> None:
+        self._log(f'Worker {worker_id} started')
         try:
             while not self._shutdown:
                 try:
@@ -129,56 +95,40 @@ class LROWorker:
                 except asyncio.TimeoutError:
                     continue
 
-                try:
-                    await self._process_task(task)
-                except Exception as e:
-                    self._log(f'Error processing task {task.task_id}: {e}')
-                    await loop.run_in_executor(
-                        self.executor, self._update_task_error, task.task_id, e
-                    )
-                finally:
-                    self.queue.task_done()
+                await self._process_task(task)
+                self.queue.task_done()
         except asyncio.CancelledError:
             pass
-        self._log(f'Worker {worker_id} stopped')
 
-    async def enqueue_tasks(self):
+    async def enqueue_tasks(self) -> int:
         loop = asyncio.get_running_loop()
         tasks = await loop.run_in_executor(self.executor, self._claim_pending_tasks, 50)
         for task in tasks:
             await self.queue.put(task)
-        return len(tasks)
+        self._log(f'Enqueued {len(tasks)} tasks, queue: {self.queue.qsize()}')
 
-    async def run(self):
-        # Запускаем воркеров
+    async def run(self) -> None:
         workers = [
             asyncio.create_task(self.worker(i))
             for i in range(self.concurrency)
         ]
 
-        # Цикл наполнения очереди
         while not self._shutdown:
-            count = await self.enqueue_tasks()
-            if count > 0:
-                self._log(f'Enqueued {count} tasks, queue size: {self.queue.qsize()}')
+            await self.enqueue_tasks()
             await asyncio.sleep(1)
-
-        self._log('🛑 Drain queue, do not enqueue new tasks...')
 
         # Ждём завершения текущих задач — но с таймаутом
         drain_task = asyncio.create_task(self.queue.join())
         try:
             await asyncio.wait_for(drain_task, timeout=30)
         except asyncio.TimeoutError:
-            self._log('⚠️  Drain timeout, forcing shutdown...')
             for w in workers:
                 w.cancel()
 
         # Ждём пока воркеры завершатся
         await asyncio.gather(*workers, return_exceptions=True)
-        self._log('All workers stopped.')
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         self._shutdown = True
 
 
@@ -188,7 +138,11 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         import sys
         loop = asyncio.new_event_loop()
-        worker = LROWorker(concurrency=50)
+        worker = LROWorker(
+            concurrency=CONCURRENCY,
+            cb_failure_threshold=5,
+            cb_open_timeout=30,
+        )
 
         def signal_handler():
             sys.stdout.write('\nGraceful shutdown requested...\n')
